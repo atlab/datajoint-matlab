@@ -26,6 +26,8 @@ if isa(CONN, 'dj.Connection')
     assert(nargin==0, ...
         'connection already instantiated. To reconnect, clear functions')
 else
+    % invoke setupDJ
+    setupDJ(true);
     % optional environment variables specifying the connection.
     env  = struct(...
         'host', 'DJ_HOST', ...
@@ -54,7 +56,7 @@ else
         pass = getenv(env.pass);
     end
     if isempty(pass)
-        pass = input('Enter datajoint password >','s');
+        pass = input('Enter datajoint password> ','s');
     end
     
     % get initial query (if any) to execute when a connection is (re)established

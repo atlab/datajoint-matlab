@@ -2,7 +2,7 @@
 % MATLAB class in the schema.
 
 
-classdef Relvar < dj.GeneralRelvar & dj.Table
+classdef Relvar < dj.internal.GeneralRelvar & dj.internal.Table
     
     properties(Dependent, SetAccess = private)
         lastInsertID        % Value of Last auto_incremented primary key
@@ -10,15 +10,8 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
     
     methods
         function self = Relvar(varargin)
-            self@dj.Table(varargin{:})
-            self.init('table',{self});
-        end
-        
-        function yes = isSubtable(self)
-            % a subtable is an imported or computed tables that does not
-            % have its own auto-populate functionality.
-            yes = ismember(self.tableHeader.info.tier, {'imported','computed'}) && ...
-                ~isa(self, 'dj.AutoPopulate');
+            self@dj.internal.Table(varargin{:})
+            self.init('table', {self});  % general relvar node
         end
         
         function id = get.lastInsertID(self)
@@ -28,15 +21,15 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
         end
         
         function delQuick(self)
-            % dj.BaseRelvar/delQuick - remove all tuples of the relation from its table.
-            % Unlike dj.BaseRelvar/del, delQuick does not prompt for user
+            % DELQUICK - remove all tuples of the relation from its table.
+            % Unlike del, delQuick does not prompt for user
             % confirmation, nor does it attempt to cascade down to the dependent tables.
             self.schema.conn.query(sprintf('DELETE FROM %s', self.sql))
         end
         
         
         function del(self)
-            % dj.BaseRelvar/del - remove all tuples of the relation from its table
+            % DEL - remove all tuples of the relation from its table
             % and, recursively, all matching tuples in dependent tables.
             %
             % A summary of the data to be removed will be provided followed by
@@ -47,25 +40,24 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
             %   del(common.Scans & 'mouse_id=12') % delete all Scans for mouse 12
             %   del(common.Scans - tp.Cells)  % delete all tuples from table common.Scans
             %                                   that do not have matching tuples in table Cells
-            %
-            % See also dj.BaseRelvar/delQuick, dj.Table/drop
+            % See also delQuick, drop
+            
+            function cleanup(self)
+                if self.schema.conn.inTransaction
+                    fprintf '\n ** delete rolled back due to an interrupt\n'
+                    self.schema.conn.cancelTransaction
+                end
+            end
+            
+            % this is guaranteed to be executed when the function is
+            % terminated even if by KeyboardInterrupt (CTRL-C)
+            cleanupObject = onCleanup(@() cleanup(self));
             
             self.schema.conn.cancelTransaction  % exit ongoing transaction, if any
             
             if ~self.exists
                 disp 'nothing to delete'
             else
-                % warn the user if deleting from a subtable
-                if ismember(self.info.tier, {'imported','computed'}) ...
-                        && ~isa(self, 'dj.AutoPopulate')
-                    fprintf(['!!! %s is a subtable. For referential integrity, ' ...
-                        'delete from its parent instead.\n'], class(self))
-                    if ~dj.set('suppressPrompt') && ~strcmpi('yes', dj.ask('Proceed anyway?'))
-                        disp 'delete cancelled'
-                        return
-                    end
-                end
-                
                 % compile the list of relvars to be deleted from
                 list = self.descendants;
                 rels = cellfun(@(name) dj.Relvar(name), list, 'UniformOutput', false);
@@ -75,16 +67,16 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
                 % apply proper restrictions
                 restrictByMe = arrayfun(@(rel) ...
                     any(ismember(...
-                    cellfun(@(r) self.schema.conn.tableToClass(r), rel.referenced,'uni',false),...
+                    cellfun(@(r) self.schema.conn.tableToClass(r), rel.parents(false), 'uni',false),...
                     list)),...
                     rels);  % restrict by all association tables, i.e. tables that make referenced to other tables
                 restrictByMe(1) = ~isempty(self.restrictions); % if self has restrictions, then restrict by self
                 for i=1:length(rels)
                     % iterate through all tables that reference rels(i)
-                    for ix = cellfun(@(child) find(strcmp(self.schema.conn.tableToClass(child),list)), [rels(i).children rels(i).referencing])
+                    for ix = cellfun(@(child) find(strcmp(self.schema.conn.tableToClass(child),list)), rels(i).children)
                         % and restrict them by it or its restrictions
                         if restrictByMe(i)
-                            rels(ix).restrict(pro(rels(i)))
+                            rels(ix).restrict(pro(rels(i)))  % TODO: handle renamed attributes  self.conn.foreignKeys(fullTableName).aliased
                         else
                             rels(ix).restrict(rels(i).restrictions{:});
                         end
@@ -103,7 +95,7 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
                 rels = rels(counts>0);
                 
                 % confirm and delete
-                if ~dj.set('suppressPrompt') && ~strcmpi('yes',dj.ask('Proceed to delete?'))
+                if ~dj.set('suppressPrompt') && ~strcmpi('yes',dj.internal.ask('Proceed to delete?'))
                     disp 'delete canceled'
                 else
                     self.schema.conn.startTransaction
@@ -115,7 +107,7 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
                         self.schema.conn.commitTransaction
                         disp committed
                     catch err
-                        fprintf '\n ** delete rolled back due to to error\n'
+                        fprintf '\n ** delete rolled back due to an error\n'
                         self.schema.conn.cancelTransaction
                         rethrow(err)
                     end
@@ -124,32 +116,103 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
         end
         
         
+        function exportCascade(self, path,  mbytesPerFile)
+            % exportCascade - export all tuples of the
+            % relation and, recursively, all matching tuples in the
+            % dependent tables.
+            %
+            % See also export
+            
+            if nargin<2
+                path = './temp';
+            end
+            if nargin<3
+                mbytesPerFile = 250;
+            end
+            
+            if ~self.exists
+                disp 'nothing to export'
+            else
+                % compile the list of relvars to be export from
+                list = self.descendants;
+                rels = cellfun(@(name) dj.Relvar(name), list, 'UniformOutput', false);
+                rels = [rels{:}];
+                rels(1) = rels(1) & self.restrictions;
+                
+                % apply proper restrictions
+                restrictByMe = arrayfun(@(rel) ...
+                    any(ismember(...
+                    cellfun(@(r) self.schema.conn.tableToClass(r), rel.parents(false), 'uni',false),...
+                    list)),...
+                    rels);  % restrict by all association tables, i.e. tables that make referenced to other tables
+                restrictByMe(1) = ~isempty(self.restrictions); % if self has restrictions, then restrict by self
+                counts = zeros(size(rels));
+                for i=1:length(rels)
+                    % iterate through all tables that reference rels(i)
+                    for ix = cellfun(@(child) find(strcmp(self.schema.conn.tableToClass(child),list)), rels(i).children)
+                        % and restrict them by it or its restrictions
+                        if restrictByMe(i)
+                            rels(ix).restrict(pro(rels(i)))
+                        else
+                            rels(ix).restrict(rels(i).restrictions{:});
+                        end
+                    end
+                    counts(i) = rels(i).count;
+                end
+                
+                % eliminate all empty relations
+                rels = rels(counts>0);
+                
+                % save
+                for rel = rels
+                    rel.export(fullfile(path, rel.className), mbytesPerFile);
+                end
+            end
+        end
+        
+        
+        
         function insert(self, tuples, command)
-            % insert an array of tuples directly into the table
+            % insert(self, tuples, command)
+            %
+            % insert an array of tuples directly into the table.
+            % The insert is performed as a single query even for multiple
+            % inserts. Therefore, it's an all-or-nothing operation: failure
+            % to insert any tuple is a failure to insert all tuples.
             %
             % The input argument tuples must a structure array with field
             % names exactly matching those in the table.
+            % 
+            % The ignoreExtraFields setting in dj.set allows ignoring fields
+            % in the tuples structure that are not found in the table.
             %
-            % The optional argument 'command' allows replacing the MySQL
-            % command from the default INSERT to INSERT IGNORE or REPLACE.
+            % The optional argument 'command' can be of the following:
+            % 'IGNORE' or 'REPLACE'.
             %
             % Duplicates, unmatched attributes, or missing required attributes will
-            % cause an error, unless command is specified.
+            % cause an error, unless 'command' is specified.
             
             if isa(tuples,'cell')
                 % if a cell array, convert to structure assuming matching attributes
                 tuples = cell2struct(tuples, self.header.names, 2);
             end
             
-            assert(isstruct(tuples), 'Tuples must be a non-empty structure array')
+            assert(isstruct(tuples), 'Tuples must be a structure array')
             if isempty(tuples)
                 return
             end
-            if nargin<=2
+            if nargin<=2 || strcmp(command, 'INSERT')
                 command = 'INSERT';
+            else
+                switch command
+                    case {'IGNORE','ignore','INSERT IGNORE'}
+                        command = 'INSERT IGNORE';
+                    case {'REPLACE', 'replace'}
+                        command = 'REPLACE';
+                    otherwise
+                        error('invalid insert option ''%s'': use ''REPLACE'' or ''IGNORE''', command)
+                end
             end
-            assert(any(strcmpi(command,{'INSERT', 'INSERT IGNORE', 'REPLACE'})), ...
-                'invalid insert command')
             header = self.header;
             
             % validate header
@@ -158,7 +221,7 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
             if any(~found)
                 if dj.set('ignore_extra_insert_fields')
                     tuples = rmfield(tuples, fnames(~found));
-                    fnames = fnames(~found);
+                    fnames = fnames(found);
                 else
                     throw(MException('DataJoint:invalidInsert',...
                         'Field %s is not found in the table %s', ...
@@ -168,63 +231,59 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
             
             % form query
             ix = ismember(header.names, fnames);
+            fields = sprintf(',`%s`',header.names{ix});
+            command = sprintf('%s INTO %s (%s) VALUES ', command, self.fullTableName, fields(2:end));
+            blobs = {};
             for tuple=tuples(:)'
-                queryStr = '';
-                blobs = {};
+                valueStr = '';
                 for i = find(ix)
                     v = tuple.(header.attributes(i).name);
                     if header.attributes(i).isString
-                        assert(ischar(v), ...
+                        assert(dj.lib.isString(v), ...
                             'The field %s must be a character string', ...
                             header.attributes(i).name)
                         if isempty(v)
-                            queryStr = sprintf('%s`%s`="",', ...
-                                queryStr, header.attributes(i).name);
+                            valueStr = sprintf('%s"",',valueStr);
                         else
-                            queryStr = sprintf('%s`%s`="{S}",', ...
-                                queryStr,header.attributes(i).name);
-                            blobs{end+1} = v;  %#ok<AGROW>
+                            valueStr = sprintf('%s"{S}",', valueStr);
+                            blobs{end+1} = char(v);  %#ok<AGROW>
                         end
                     elseif header.attributes(i).isBlob
-                        queryStr = sprintf('%s`%s`="{M}",', ...
-                            queryStr,header.attributes(i).name);
+                        valueStr = sprintf('%s"{M}",', valueStr);
                         blobs{end+1} = v;    %#ok<AGROW>
                     else
-                        assert((isscalar(v) && (isnumeric(v) || islogical(v))) || isempty(v),...
+                        assert((isnumeric(v) || islogical(v)) && (isscalar(v) || isempty(v)),...
                             'The field %s must be a numeric scalar value', ...
                             header.attributes(i).name)
-                        if isempty(v)
-                            queryStr = sprintf('%s`%s`=NULL,',...
-                                queryStr, header.attributes(i).name);
-                        elseif ~isnan(v)  % nans are not passed: assumed missing.
-                            integerTypes = {'bigint','mediumint','int','smallint','tinyint'};
-                            if any(strcmpi(header.attributes(i).type, integerTypes))
-                                queryStr = sprintf('%s`%s`=%d,',...
-                                    queryStr, header.attributes(i).name, v);
-                            elseif any(strcmp(header.attributes(i).type, cellfun(@(s) sprintf('%s unsigned',s), integerTypes, 'uni', false)))
-                                queryStr = sprintf('%s`%s`=%u,',...
-                                    queryStr, header.attributes(i).name, v);
+                        if isempty(v) || isnan(v) % empty numeric values and nans are passed as nulls
+                            valueStr = sprintf('%sNULL,', valueStr);
+                        elseif isinf(v)
+                            error 'Infinite values are not allowed in numeric fields'
+                        else  % numeric values
+                            type = header.attributes(i).type;
+                            if length(type)>=3 && strcmpi(type(end-2:end),'int')
+                                valueStr = sprintf('%s%d,', valueStr, v);
+                            elseif length(type)>=12 && strcmpi(type(end-11:end),'int unsigned')
+                                valueStr = sprintf('%s%u,', valueStr, v);
                             else
-                                queryStr = sprintf('%s`%s`=%1.16g,',...
-                                    queryStr, header.attributes(i).name, v);
+                                valueStr = sprintf('%s%1.16g,',valueStr, v);
                             end
                         end
                     end
                 end
-                
-                % issue query
-                self.schema.conn.query( sprintf('%s %s SET %s', ...
-                    command, self.fullTableName, ...
-                    queryStr(1:end-1)), blobs{:})
+                command = sprintf('%s(%s),', command, valueStr(1:end-1));
             end
+            % issue query
+            command(end)=0;
+            self.schema.conn.query(command, blobs{:});
         end
         
         
         function inserti(self, tuples)
             % insert tuples but ignore errors. This is useful for rare
             % applications when duplicate entries should be quietly
-            % discarded, for example.
-            self.insert(tuples, 'INSERT IGNORE')
+            % discarded.
+            self.insert(tuples, 'IGNORE')
         end
         
         
@@ -233,8 +292,8 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
             % has not completed yet.  Thus insertParallel uses at most one
             % parallel thread.  Call with no arguments to wait for the last
             % job to complete.
-            % 
-            % Initialize the parallel pool before inserting as parpool('local',1), for example. 
+            %
+            % Initialize the parallel pool before inserting as parpool('local',1), for example.
             %
             % Requires MATLAB R2013b or later.
             
@@ -243,7 +302,7 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
                 thread = THREAD;
                 THREAD = [];  % clear the job in case there was an error
                 thread.fetchOutputs  % wait to complete previous insert
-            end            
+            end
             pool = gcp('nocreate');
             assert(~isempty(pool), ...
                 'A parallel pool must be created first, e.g. parpool(''local'',1')
@@ -254,8 +313,8 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
         
         
         function import(self, fileMask)
-            % dj.Relvar/import -- load data from .mat files
-            % See also dj.GeneralRelvar/export
+            % IMPORT(self, fileMask) - load data into one table from .mat files
+            % See also export
             countTuples = 0;
             for f = dir(fileMask)'
                 fprintf('Reading file %s  ', f.name)
@@ -268,7 +327,7 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
         
         
         function update(self, attrname, value)
-            % dj.BaseRelvar/update - update a field in an existing tuple
+            % update - update a field in an existing tuple
             %
             % Relational database maintain referential integrity on the level
             % of a tuple. Therefore, the UPDATE operator can violate referential
@@ -293,18 +352,18 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
             
             switch true
                 case isNull
-                    queryStr = 'NULL';
+                    valueStr = 'NULL';
                     value = {};
                 case header.attributes(ix).isString
-                    assert(ischar(value), 'Value must be a string')
-                    queryStr = '"{S}"';
-                    value = {value};
+                    assert(dj.lib.isString(value), 'Value must be a string')
+                    valueStr = '"{S}"';
+                    value = {char(value)};
                 case header.attributes(ix).isBlob
                     if isempty(value) && header.attributes(ix).isnullable
-                        queryStr = 'NULL';
+                        valueStr = 'NULL';
                         value = {};
                     else
-                        queryStr = '"{M}"';
+                        valueStr = '"{M}"';
                         value = {value};
                     end
                 case header.attributes(ix).isNumeric
@@ -312,19 +371,61 @@ classdef Relvar < dj.GeneralRelvar & dj.Table
                     if isnan(value)
                         assert(header.attributes(ix).isnullable, ...
                             'attribute `%s` is not nullable. NaNs not allowed', attrname)
-                        queryStr = 'NULL';
+                        valueStr = 'NULL';
                         value = {};
                     else
-                        queryStr = sprintf('%1.16g',value);
+                        valueStr = sprintf('%1.16g',value);
                         value = {};
                     end
                 otherwise
                     error 'invalid update command'
             end
             
-            queryStr = sprintf('UPDATE %s SET `%s`=%s %s', ...
-                self.fullTableName, attrname, queryStr, self.whereClause);
-            self.schema.conn.query(queryStr, value{:})
+            valueStr = sprintf('UPDATE %s SET `%s`=%s %s', ...
+                self.fullTableName, attrname, valueStr, self.whereClause);
+            self.schema.conn.query(valueStr, value{:})
+        end
+    end
+    
+    methods(Static)
+        function importAll(path)
+            % Import all files from path/schema.ClassName-*.mat
+            % The files are first sorted in order of dependencies.
+            % Their contents are then inserted in order of dependencies.
+            
+            s = dir(fullfile(path,'*-*.mat'));
+            if isempty(s)
+                warning 'no matching files found'
+                return
+            end
+            
+            % create all tables
+            disp Declaring..
+            relvars = {};
+            conn = [];
+            for f = {s.name}
+                tableName = f{1}(1:find(f{1}=='-',1,'first')-1);
+                %make sure all schemas are loaded
+                if exist(tableName, 'class')
+                    r = feval(tableName);  % instantiate
+                    conn = r.conn;
+                    relvars{end+1} = r; %#ok<AGROW>
+                    assert(isa(r, 'dj.Relvar'), ...
+                        'class %s must be a Relvar', tableName)
+                    r.info;  % create tables if not yet created
+                else
+                    warning('%s is not found', tableName)
+                end
+            end
+            
+            % populate tables in order of dependence
+            disp Inserting..
+            names = cellfun(@(r) r.fullTableName, relvars, 'uni', false);
+            for i = toposort(conn.makeGraph(names))
+                disp(names{i})
+                contents = load(fullfile(path, names{i}));
+                relvars{i}.inserti(contents.tuples);
+            end
         end
     end
 end

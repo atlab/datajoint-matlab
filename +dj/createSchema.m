@@ -1,4 +1,10 @@
-function newSchema
+function createSchema(package)
+% DJ.CREATESCHEMA - interactively create a new DataJoint schema
+%
+% INPUT:
+%   (optional) package - name of the package to be associated with the
+%   schema
+
 
 dbname = input('Enter database name >> ','s');
 
@@ -18,7 +24,17 @@ else
         disp 'database created'
     end
     
-    folder = uigetdir('./','Select of create package folder');
+    if nargin < 1
+        disp 'Please select a package folder. Opening UI...'
+        folder = uigetdir('./','Select a package folder');
+    else
+        fprintf('Please select folder to create package %s in. Opening UI...\n', ['+', package])
+        folder = uigetdir('./', sprintf('Select folder to create package %s in', ['+', package]));
+        if folder
+            folder = fullfile(folder, ['+', package]);
+            mkdir(folder)
+        end
+    end
     
     if ~folder
         disp 'No package selected.  Cancelled.'
@@ -32,7 +48,7 @@ else
         % create the getSchema function
         schemaFile = fullfile(folder,'getSchema.m');
         if exist(schemaFile,'file')
-            fprintf('%s.getSchema.m already exists', package)
+            fprintf('%s.getSchema.m already exists\n', package)
         else
             f = fopen(schemaFile,'wt');
             assert(-1 ~= f, 'Could not open %s', f)
